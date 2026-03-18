@@ -75,21 +75,14 @@ export function projectRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     type CreateProjectPayload = Parameters<typeof svc.create>[1] & {
       workspace?: Parameters<typeof svc.createWorkspace>[1];
+      bootstrap?: import("@paperclipai/shared").ProjectBootstrap;
     };
 
-    const { workspace, ...projectData } = req.body as CreateProjectPayload;
-    const project = await svc.create(companyId, projectData);
-    let createdWorkspaceId: string | null = null;
-    if (workspace) {
-      const createdWorkspace = await svc.createWorkspace(project.id, workspace);
-      if (!createdWorkspace) {
-        await svc.remove(project.id);
-        res.status(422).json({ error: "Invalid project workspace payload" });
-        return;
-      }
-      createdWorkspaceId = createdWorkspace.id;
-    }
-    const hydratedProject = workspace ? await svc.getById(project.id) : project;
+    const { workspace, bootstrap, ...projectData } = req.body as CreateProjectPayload;
+    const project = workspace || bootstrap
+      ? await svc.createWithBootstrap(companyId, projectData, { workspace, bootstrap })
+      : await svc.create(companyId, projectData);
+    const createdWorkspaceId = project.primaryWorkspace?.id ?? null;
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -103,9 +96,10 @@ export function projectRoutes(db: Db) {
       details: {
         name: project.name,
         workspaceId: createdWorkspaceId,
+        bootstrapTemplateId: bootstrap?.templateId ?? null,
       },
     });
-    res.status(201).json(hydratedProject ?? project);
+    res.status(201).json(project);
   });
 
   router.patch("/projects/:id", validate(updateProjectSchema), async (req, res) => {
