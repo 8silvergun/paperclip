@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -30,6 +32,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
+const execFile = promisify(execFileCb);
+const AUTO_COMMIT_SECRET_PATH_REGEX = /(^|\/)(\.env(\.|$)|credentials\.json|.*secret.*|.*token.*|id_rsa|id_ed25519|.*\.pem)$/i;
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -751,6 +755,105 @@ export function heartbeatService(db: Db) {
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
+  async function runGit(cwd: string, args: string[], env?: Record<string, string>) {
+    const mergedEnv = env ? { ...process.env, ...env } : process.env;
+    const { stdout } = await execFile("git", args, {
+      cwd,
+      env: mergedEnv,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return stdout.trim();
+  }
+
+  async function tryAutoCommitPushWorkspace(input: {
+    cwd: string;
+    agent: typeof agents.$inferSelect;
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string | null;
+  }) {
+    const { cwd, agent, run, issueId } = input;
+    try {
+      const isRepo = await runGit(cwd, ["rev-parse", "--is-inside-work-tree"])
+        .then((value) => value === "true")
+        .catch(() => false);
+      if (!isRepo) {
+        return { attempted: false, committed: false, pushed: false, reason: "not_git_repo" as const };
+      }
+
+      const status = await runGit(cwd, ["status", "--porcelain"]);
+      if (!status) {
+        return { attempted: false, committed: false, pushed: false, reason: "no_changes" as const };
+      }
+
+      const changedPaths = status
+        .split("\n")
+        .map((line) => line.slice(3).trim())
+        .filter(Boolean)
+        .map((line) => line.split(" -> ").pop() ?? line);
+
+      if (changedPaths.some((p) => AUTO_COMMIT_SECRET_PATH_REGEX.test(p))) {
+        return {
+          attempted: false,
+          committed: false,
+          pushed: false,
+          reason: "secret_like_path_detected" as const,
+          changedPaths,
+        };
+      }
+
+      const safeAgentName = agent.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const commitMessage = issueId
+        ? `chore(agent): ${safeAgentName} auto-complete ${issueId}`
+        : `chore(agent): ${safeAgentName} auto-complete run`;
+      const actorEmail = `${safeAgentName.toLowerCase()}@paperclip.local`;
+      const actorEnv = {
+        GIT_AUTHOR_NAME: safeAgentName,
+        GIT_AUTHOR_EMAIL: actorEmail,
+        GIT_COMMITTER_NAME: safeAgentName,
+        GIT_COMMITTER_EMAIL: actorEmail,
+      };
+
+      await runGit(cwd, ["add", "-A"]);
+      await runGit(cwd, ["commit", "-m", commitMessage], actorEnv);
+      const commitHash = await runGit(cwd, ["rev-parse", "HEAD"]);
+
+      let pushed = false;
+      let pushError: string | null = null;
+      try {
+        await runGit(cwd, ["push"]);
+        pushed = true;
+      } catch (err) {
+        const branch = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "HEAD");
+        if (branch && branch !== "HEAD") {
+          await runGit(cwd, ["push", "-u", "origin", branch]).catch((fallbackErr) => {
+            pushError = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          });
+          if (!pushError) pushed = true;
+        } else {
+          pushError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      return {
+        attempted: true,
+        committed: true,
+        pushed,
+        commitHash,
+        changedPaths,
+        reason: pushed ? "ok" : "push_failed",
+        pushError,
+      };
+    } catch (err) {
+      return {
+        attempted: true,
+        committed: false,
+        pushed: false,
+        reason: "auto_commit_failed" as const,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
     seq: number,
@@ -1333,7 +1436,7 @@ export function heartbeatService(db: Db) {
             ? "timeout"
             : outcome === "cancelled"
               ? "cancelled"
-              : outcome === "failed"
+          : outcome === "failed"
                 ? (adapterResult.errorCode ?? "adapter_failed")
                 : null,
         exitCode: adapterResult.exitCode,
@@ -1352,6 +1455,23 @@ export function heartbeatService(db: Db) {
         finishedAt: new Date(),
         error: adapterResult.errorMessage ?? null,
       });
+
+      if (outcome === "succeeded") {
+        const issueId = readNonEmptyString(context.issueId);
+        const autoGit = await tryAutoCommitPushWorkspace({
+          cwd: resolvedWorkspace.cwd,
+          agent,
+          run,
+          issueId,
+        });
+        await appendRunEvent(run, seq++, {
+          eventType: "git.auto_push",
+          stream: "system",
+          level: autoGit.pushed || autoGit.reason === "no_changes" ? "info" : "warn",
+          message: "auto commit/push",
+          payload: autoGit as unknown as Record<string, unknown>,
+        });
+      }
 
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {

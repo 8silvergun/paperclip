@@ -86,6 +86,46 @@ Notes:
 - A workspace must include at least one of `cwd` or `repoUrl`.
 - For repo-only projects, omit `cwd` and provide `repoUrl`.
 
+### Create Project With Bootstrap Template
+
+Use `bootstrap` when you want a new project to be created with an initial goal and one or more workspaces in a single request.
+
+```
+POST /api/companies/{companyId}/projects
+{
+  "name": "Project Atlas",
+  "description": "Example product workspace bootstrap",
+  "status": "planned",
+  "bootstrap": {
+    "templateId": "project_with_goal_and_workspace",
+    "goal": {
+      "useProjectNameAsTitle": true,
+      "titleSuffix": " launch",
+      "description": "Bootstrap the initial delivery goal for the project",
+      "level": "company",
+      "status": "active"
+    },
+    "workspaces": [
+      {
+        "cwd": "/path/to/project-atlas",
+        "repoUrl": "https://github.com/org/project-atlas",
+        "isPrimary": true
+      }
+    ]
+  }
+}
+```
+
+Bootstrap notes:
+
+- `templateId` currently supports `project_with_goal_and_workspace`, `project_with_goal`, and `project_with_workspaces`.
+- `goal` is optional. If provided without `title`, the project name is used and `titleSuffix` is appended when present.
+- `workspaces` is optional. If provided, each workspace uses the same validation rules as the normal project workspace APIs.
+- `project_with_goal_and_workspace` requires both `goal` and at least one workspace.
+- `project_with_goal` requires `goal` and forbids `workspaces`.
+- `project_with_workspaces` requires at least one workspace and forbids `goal`.
+- Bootstrap is transactional: if any seeded goal/workspace creation fails, the project create request fails without leaving partial bootstrap data behind.
+
 ### Update Project
 
 ```

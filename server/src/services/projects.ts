@@ -6,6 +6,7 @@ import {
   deriveProjectUrlKey,
   isUuidLike,
   normalizeProjectUrlKey,
+  type ProjectBootstrap,
   type ProjectGoalRef,
   type ProjectWorkspace,
 } from "@paperclipai/shared";
@@ -192,6 +193,147 @@ function deriveWorkspaceName(input: {
   return "Workspace";
 }
 
+function resolveBootstrapGoalTitle(projectName: string, goal: NonNullable<ProjectBootstrap["goal"]>) {
+  const explicitTitle = readNonEmptyString(goal.title);
+  if (explicitTitle) return explicitTitle;
+
+  const suffix = readNonEmptyString(goal.titleSuffix) ?? "";
+  return `${projectName}${suffix}`;
+}
+
+async function createProjectRecord(
+  dbOrTx: any,
+  companyId: string,
+  data: Omit<typeof projects.$inferInsert, "companyId"> & { goalIds?: string[] },
+): Promise<ProjectRow> {
+  const { goalIds: inputGoalIds, ...projectData } = data;
+  const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
+
+  if (!projectData.color) {
+    const existing = await dbOrTx.select({ color: projects.color }).from(projects).where(eq(projects.companyId, companyId));
+    const usedColors = new Set(existing.map((r: { color: string | null }) => r.color).filter(Boolean));
+    const nextColor = PROJECT_COLORS.find((c) => !usedColors.has(c)) ?? PROJECT_COLORS[existing.length % PROJECT_COLORS.length];
+    projectData.color = nextColor;
+  }
+
+  const legacyGoalId = ids && ids.length > 0 ? ids[0] : projectData.goalId ?? null;
+
+  const row = await dbOrTx
+    .insert(projects)
+    .values({ ...projectData, goalId: legacyGoalId, companyId })
+    .returning()
+    .then((rows: ProjectRow[]) => rows[0]);
+
+  if (ids && ids.length > 0) {
+    await syncGoalLinks(dbOrTx, row.id, companyId, ids);
+  }
+
+  return row;
+}
+
+async function createWorkspaceForProject(
+  dbOrTx: any,
+  project: ProjectRow,
+  data: CreateWorkspaceInput,
+): Promise<ProjectWorkspace | null> {
+  const cwd = normalizeWorkspaceCwd(data.cwd);
+  const repoUrl = readNonEmptyString(data.repoUrl);
+  if (!cwd && !repoUrl) return null;
+  const name = deriveWorkspaceName({
+    name: data.name,
+    cwd,
+    repoUrl,
+  });
+
+  const existing = await dbOrTx
+    .select()
+    .from(projectWorkspaces)
+    .where(eq(projectWorkspaces.projectId, project.id))
+    .orderBy(asc(projectWorkspaces.createdAt))
+    .then((rows: ProjectWorkspaceRow[]) => rows);
+
+  const shouldBePrimary = data.isPrimary === true || existing.length === 0;
+  if (shouldBePrimary) {
+    await dbOrTx
+      .update(projectWorkspaces)
+      .set({ isPrimary: false, updatedAt: new Date() })
+      .where(
+        and(
+          eq(projectWorkspaces.companyId, project.companyId),
+          eq(projectWorkspaces.projectId, project.id),
+        ),
+      );
+  }
+
+  const row = await dbOrTx
+    .insert(projectWorkspaces)
+    .values({
+      companyId: project.companyId,
+      projectId: project.id,
+      name,
+      cwd: cwd ?? null,
+      repoUrl: repoUrl ?? null,
+      repoRef: readNonEmptyString(data.repoRef),
+      metadata: (data.metadata as Record<string, unknown> | null | undefined) ?? null,
+      isPrimary: shouldBePrimary,
+    })
+    .returning()
+    .then((rows: ProjectWorkspaceRow[]) => rows[0] ?? null);
+
+  return row ? toWorkspace(row) : null;
+}
+
+async function applyBootstrapWithTx(dbOrTx: any, project: ProjectRow, bootstrap: ProjectBootstrap) {
+  switch (bootstrap.templateId) {
+    case "project_with_goal_and_workspace":
+    case "project_with_goal": {
+      if (bootstrap.goal) {
+        const createdGoal = await dbOrTx
+          .insert(goals)
+          .values({
+            companyId: project.companyId,
+            title: resolveBootstrapGoalTitle(project.name, bootstrap.goal),
+            description: bootstrap.goal.description ?? null,
+            level: bootstrap.goal.level,
+            status: bootstrap.goal.status,
+            parentId: bootstrap.goal.parentId ?? null,
+            ownerAgentId: bootstrap.goal.ownerAgentId ?? null,
+          })
+          .returning()
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+
+        if (!createdGoal) {
+          throw new Error("Failed to create bootstrap goal.");
+        }
+
+        const currentGoalIds = await dbOrTx
+          .select({ goalId: projectGoals.goalId })
+          .from(projectGoals)
+          .where(eq(projectGoals.projectId, project.id))
+          .then((rows: Array<{ goalId: string }>) => rows.map((row) => row.goalId));
+        const mergedGoalIds = [...new Set([...currentGoalIds, createdGoal.id])];
+        await syncGoalLinks(dbOrTx, project.id, project.companyId, mergedGoalIds);
+        await dbOrTx
+          .update(projects)
+          .set({ goalId: mergedGoalIds[0] ?? null, updatedAt: new Date() })
+          .where(eq(projects.id, project.id));
+      }
+      break;
+    }
+    case "project_with_workspaces":
+      break;
+    default:
+      throw new Error(`Unsupported project bootstrap template: ${String((bootstrap as { templateId?: string }).templateId)}`);
+  }
+
+  for (const workspace of bootstrap.workspaces ?? []) {
+    const createdWorkspace = await createWorkspaceForProject(dbOrTx, project, workspace);
+    if (!createdWorkspace) {
+      throw new Error("Failed to create bootstrap workspace.");
+    }
+  }
+}
+
 async function ensureSinglePrimaryWorkspace(
   dbOrTx: any,
   input: {
@@ -223,7 +365,7 @@ async function ensureSinglePrimaryWorkspace(
 }
 
 export function projectService(db: Db) {
-  return {
+  const svc = {
     list: async (companyId: string): Promise<ProjectWithGoals[]> => {
       const rows = await db.select().from(projects).where(eq(projects.companyId, companyId));
       const withGoals = await attachGoals(db, rows);
@@ -260,33 +402,55 @@ export function projectService(db: Db) {
       companyId: string,
       data: Omit<typeof projects.$inferInsert, "companyId"> & { goalIds?: string[] },
     ): Promise<ProjectWithGoals> => {
-      const { goalIds: inputGoalIds, ...projectData } = data;
-      const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
-
-      // Auto-assign a color from the palette if none provided
-      if (!projectData.color) {
-        const existing = await db.select({ color: projects.color }).from(projects).where(eq(projects.companyId, companyId));
-        const usedColors = new Set(existing.map((r) => r.color).filter(Boolean));
-        const nextColor = PROJECT_COLORS.find((c) => !usedColors.has(c)) ?? PROJECT_COLORS[existing.length % PROJECT_COLORS.length];
-        projectData.color = nextColor;
-      }
-
-      // Also write goalId to the legacy column (first goal or null)
-      const legacyGoalId = ids && ids.length > 0 ? ids[0] : projectData.goalId ?? null;
-
-      const row = await db
-        .insert(projects)
-        .values({ ...projectData, goalId: legacyGoalId, companyId })
-        .returning()
-        .then((rows) => rows[0]);
-
-      if (ids && ids.length > 0) {
-        await syncGoalLinks(db, row.id, companyId, ids);
-      }
+      const row = await createProjectRecord(db, companyId, data);
 
       const [withGoals] = await attachGoals(db, [row]);
       const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
       return enriched!;
+    },
+
+    createWithBootstrap: async (
+      companyId: string,
+      data: Omit<typeof projects.$inferInsert, "companyId"> & { goalIds?: string[] },
+      opts?: { workspace?: CreateWorkspaceInput; bootstrap?: ProjectBootstrap },
+    ): Promise<ProjectWithGoals> => {
+      const projectId = await db.transaction(async (tx) => {
+        const createdProject = await createProjectRecord(tx, companyId, data);
+
+        if (opts?.workspace) {
+          const createdWorkspace = await createWorkspaceForProject(tx, createdProject, opts.workspace);
+          if (!createdWorkspace) {
+            throw new Error("Invalid project workspace payload");
+          }
+        }
+
+        if (opts?.bootstrap) {
+          await applyBootstrapWithTx(tx, createdProject, opts.bootstrap);
+        }
+
+        return createdProject.id;
+      });
+
+      const hydrated = await svc.getById(projectId);
+      if (!hydrated) {
+        throw new Error("Created project could not be reloaded after bootstrap.");
+      }
+      return hydrated;
+    },
+
+    applyBootstrap: async (projectId: string, bootstrap: ProjectBootstrap): Promise<ProjectWithGoals | null> => {
+      const project = await db
+        .select()
+        .from(projects)
+        .where(eq(projects.id, projectId))
+        .then((rows) => rows[0] ?? null);
+      if (!project) return null;
+
+      await db.transaction(async (tx) => {
+        await applyBootstrapWithTx(tx, project, bootstrap);
+      });
+
+      return svc.getById(projectId);
     },
 
     update: async (
@@ -353,54 +517,7 @@ export function projectService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!project) return null;
 
-      const cwd = normalizeWorkspaceCwd(data.cwd);
-      const repoUrl = readNonEmptyString(data.repoUrl);
-      if (!cwd && !repoUrl) return null;
-      const name = deriveWorkspaceName({
-        name: data.name,
-        cwd,
-        repoUrl,
-      });
-
-      const existing = await db
-        .select()
-        .from(projectWorkspaces)
-        .where(eq(projectWorkspaces.projectId, projectId))
-        .orderBy(asc(projectWorkspaces.createdAt))
-        .then((rows) => rows);
-
-      const shouldBePrimary = data.isPrimary === true || existing.length === 0;
-      const created = await db.transaction(async (tx) => {
-        if (shouldBePrimary) {
-          await tx
-            .update(projectWorkspaces)
-            .set({ isPrimary: false, updatedAt: new Date() })
-            .where(
-              and(
-                eq(projectWorkspaces.companyId, project.companyId),
-                eq(projectWorkspaces.projectId, projectId),
-              ),
-            );
-        }
-
-        const row = await tx
-          .insert(projectWorkspaces)
-          .values({
-            companyId: project.companyId,
-            projectId,
-            name,
-            cwd: cwd ?? null,
-            repoUrl: repoUrl ?? null,
-            repoRef: readNonEmptyString(data.repoRef),
-            metadata: (data.metadata as Record<string, unknown> | null | undefined) ?? null,
-            isPrimary: shouldBePrimary,
-          })
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        return row;
-      });
-
-      return created ? toWorkspace(created) : null;
+      return db.transaction(async (tx) => createWorkspaceForProject(tx, project, data));
     },
 
     updateWorkspace: async (
@@ -615,4 +732,6 @@ export function projectService(db: Db) {
       return { project: null, ambiguous: false } as const;
     },
   };
+
+  return svc;
 }

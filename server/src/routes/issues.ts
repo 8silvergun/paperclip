@@ -27,6 +27,9 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 
+const SILVERGUN_ISSUE_PREFIX = "SIL-";
+const COMPLETION_MARKER_REGEX = /(완료조건|acceptance criteria|done when)/i;
+
 const MAX_ATTACHMENT_BYTES = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
   "image/png",
@@ -49,6 +52,263 @@ export function issueRoutes(db: Db, storage: StorageService) {
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_ATTACHMENT_BYTES, files: 1 },
   });
+
+  type CreatedIssue = {
+    id: string;
+    companyId: string;
+    identifier: string;
+    title: string;
+    description: string | null;
+    status: string;
+    projectId: string | null;
+    goalId: string | null;
+    assigneeAgentId: string | null;
+  };
+
+  function shouldApplySilverGunIssuePolicy(issue: Pick<CreatedIssue, "identifier">, actorType: "agent" | "user") {
+    return actorType === "user" && issue.identifier.toUpperCase().startsWith(SILVERGUN_ISSUE_PREFIX);
+  }
+
+  function evaluateSilverGunIssueRuleViolations(issue: Pick<CreatedIssue, "projectId" | "goalId" | "description">) {
+    const violations: string[] = [];
+    if (!issue.projectId && !issue.goalId) {
+      violations.push("프로젝트 또는 Goal 연결");
+    }
+
+    const description = issue.description?.trim() ?? "";
+    if (description.length < 30) {
+      violations.push("설명 30자 이상");
+    }
+
+    if (!COMPLETION_MARKER_REGEX.test(description)) {
+      violations.push("완료조건(acceptance criteria) 명시");
+    }
+
+    return violations;
+  }
+
+  async function getCeoAgent(companyId: string) {
+    const agents = await agentsSvc.list(companyId);
+    return agents.find((agent) => agent.role === "ceo") ?? null;
+  }
+
+  async function resolveSilverGunDelegationTarget(input: {
+    companyId: string;
+    title: string;
+    description: string | null;
+    ceoAgentId: string;
+  }) {
+    const { companyId, title, description, ceoAgentId } = input;
+    const agents = await agentsSvc.list(companyId);
+    const normalize = (value: string) => value.trim().toLowerCase().replace(/\s+/g, "_");
+    const byName = new Map(agents.map((agent) => [normalize(agent.name), agent]));
+    const text = `${title}\n${description ?? ""}`.toLowerCase();
+
+    const roleRules: Array<{ agentName: string; patterns: RegExp[]; reason: string }> = [
+      {
+        agentName: "backend",
+        patterns: [/\bapi\b/, /backend/, /database/, /schema/, /migration/, /server/],
+        reason: "backend-domain",
+      },
+      {
+        agentName: "frontend",
+        patterns: [/frontend/, /\bui\b/, /\bux\b/, /react/, /screen/, /component/],
+        reason: "frontend-domain",
+      },
+      {
+        agentName: "ai_ml",
+        patterns: [/\bai\b/, /\bml\b/, /model/, /추천/, /matching/, /ranking/],
+        reason: "ai-domain",
+      },
+      {
+        agentName: "chatbot_dev",
+        patterns: [/chatbot/, /conversation/, /intent/, /faq/, /dialog/],
+        reason: "chatbot-domain",
+      },
+      {
+        agentName: "founding_engineer",
+        patterns: [/integration/, /deploy/, /release/, /handoff/, /demo/],
+        reason: "integration-domain",
+      },
+      {
+        agentName: "cto",
+        patterns: [/architecture/, /tech spec/, /design doc/, /system design/, /infra/],
+        reason: "cto-domain",
+      },
+    ];
+
+    for (const rule of roleRules) {
+      if (!rule.patterns.some((pattern) => pattern.test(text))) continue;
+      const target = byName.get(normalize(rule.agentName));
+      if (target) {
+        return {
+          assigneeAgentId: target.id,
+          assigneeUserId: null,
+          reason: rule.reason,
+          assigneeName: target.name,
+          delegatedByCeo: target.id !== ceoAgentId,
+        };
+      }
+    }
+
+    const cto = byName.get("cto");
+    if (cto) {
+      return {
+        assigneeAgentId: cto.id,
+        assigneeUserId: null,
+        reason: "fallback-cto-triage",
+        assigneeName: cto.name,
+        delegatedByCeo: cto.id !== ceoAgentId,
+      };
+    }
+
+    return {
+      assigneeAgentId: ceoAgentId,
+      assigneeUserId: null,
+      reason: "fallback-ceo",
+      assigneeName: "CEO",
+      delegatedByCeo: false,
+    };
+  }
+
+  async function applySilverGunIssuePolicy(input: { issue: CreatedIssue; actor: ReturnType<typeof getActorInfo> }) {
+    const { issue, actor } = input;
+
+    if (!shouldApplySilverGunIssuePolicy(issue, actor.actorType)) {
+      return issue;
+    }
+
+    const ceo = await getCeoAgent(issue.companyId);
+    if (!ceo) {
+      logger.warn({ companyId: issue.companyId, issueId: issue.id }, "SilverGun policy skipped: CEO agent not found");
+      return issue;
+    }
+
+    const violations = evaluateSilverGunIssueRuleViolations(issue);
+    if (violations.length > 0) {
+      const guidance = [
+        "[CEO 자동검토] 이 이슈는 규칙이 부족해 바로 분배할 수 없습니다.",
+        "",
+        "보완이 필요한 항목:",
+        ...violations.map((entry) => `- ${entry}`),
+        "",
+        "권장 템플릿:",
+        "- 목표: ...",
+        "- 범위/맥락: ...",
+        "- 완료조건: ...",
+      ].join("\n");
+
+      const policyComment = await svc.addComment(issue.id, guidance, { agentId: ceo.id });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "agent",
+        actorId: ceo.id,
+        agentId: ceo.id,
+        runId: null,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: policyComment.id,
+          bodySnippet: policyComment.body.slice(0, 120),
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          source: "silvergun_policy",
+          policyViolations: violations,
+        },
+      });
+
+      void heartbeat
+        .wakeup(ceo.id, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "silvergun_issue_policy_review",
+          payload: { issueId: issue.id, mutation: "create", violations },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: { issueId: issue.id, source: "issue.create.policy.invalid" },
+        })
+        .catch((err) => logger.warn({ err, issueId: issue.id, agentId: ceo.id }, "failed to wake CEO on policy guidance"));
+
+      return issue;
+    }
+
+    const delegation = await resolveSilverGunDelegationTarget({
+      companyId: issue.companyId,
+      title: issue.title,
+      description: issue.description,
+      ceoAgentId: ceo.id,
+    });
+
+    const patch: {
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      title?: string;
+      status?: string;
+    } = {
+      assigneeAgentId: delegation.assigneeAgentId,
+      assigneeUserId: delegation.assigneeUserId,
+    };
+    if (!issue.title.startsWith("[USER] ")) {
+      patch.title = `[USER] ${issue.title}`;
+    }
+    if (issue.status === "backlog") {
+      patch.status = "todo";
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return issue;
+    }
+
+    const updated = await svc.update(issue.id, patch);
+    if (!updated) return issue;
+
+    if (delegation.delegatedByCeo) {
+      const delegationComment = await svc.addComment(
+        issue.id,
+        `[CEO 자동분배] 이슈를 ${delegation.assigneeName} 에이전트로 배정했습니다. (reason: ${delegation.reason})`,
+        { agentId: ceo.id },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "agent",
+        actorId: ceo.id,
+        agentId: ceo.id,
+        runId: null,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          source: "silvergun_policy",
+          commentId: delegationComment.id,
+          bodySnippet: delegationComment.body.slice(0, 120),
+          identifier: issue.identifier,
+        },
+      });
+    }
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "agent",
+      actorId: ceo.id,
+      agentId: ceo.id,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: updated.id,
+      details: {
+        identifier: updated.identifier,
+        source: "silvergun_policy",
+        title: patch.title,
+        assigneeAgentId: patch.assigneeAgentId,
+        status: patch.status,
+      },
+    });
+
+    return updated as CreatedIssue;
+  }
 
   function withContentPath<T extends { id: string }>(attachment: T) {
     return {
@@ -414,7 +674,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
-    const issue = await svc.create(companyId, {
+    let issue = await svc.create(companyId, {
       ...req.body,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -431,6 +691,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
       entityId: issue.id,
       details: { title: issue.title, identifier: issue.identifier },
     });
+
+    await applySilverGunIssuePolicy({ issue: issue as CreatedIssue, actor });
+    const policyAdjustedIssue = await svc.getById(issue.id);
+    if (policyAdjustedIssue) {
+      issue = policyAdjustedIssue;
+    }
 
     if (issue.assigneeAgentId && issue.status !== "backlog") {
       void heartbeat
